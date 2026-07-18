@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SI-Lingual Terminal</title>
+    <link rel="stylesheet" href="styles.css">
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        .video-container {
+            position: relative !important;
+            overflow: hidden;
+            width: 100%;
+            aspect-ratio: 4/3;
+            background: #000;
+        }
+        #webcam {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            object-fit: cover !important;
+            z-index: 1 !important;
+            opacity: 0 !important; /* Hidden to eliminate tracking visual latency */
+            pointer-events: none !important;
+            transition: none !important; 
+        }
+        #output_canvas {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            z-index: 10 !important;          
+            pointer-events: none !important; 
+            transition: none !important;      
+        }
+    </style>
+</head>
+<body>
+
+    <div class="app-glass-wrapper">
+        <aside class="sidebar-panel">
+            <div class="brand-header">
+                <div class="logo-box">
+                    <img src="logo.avif" alt="SI-Lingual Logo" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+                    <span style="display:none; font-size:20px;">🫰</span>
+                </div>
+                <h2>SI-Lingual</h2>
+            </div>
+
+            <div class="camera-card">
+                <div class="video-container">
+                    <video id="webcam" autoplay playsinline></video>
+                    <canvas id="output_canvas"></canvas>
+                    <div id="loading-overlay" class="loading-screen">Loading Vision Models...</div>
+                </div>
+                <div class="tracking-status-bar">
+                    <span class="pulse-dot" id="status-dot"></span>
+                    <span id="gesture-detected">Calibrating Optics...</span>
+                </div>
+            </div>
+
+            <div class="matrix-instructions">
+                <details class="vocab-accordion">
+                    <summary class="vocab-summary">
+                        <h3>📋 System Vocabulary Grid</h3>
+                        <span class="chevron-icon">▼</span>
+                    </summary>
+                    <div class="vocab-content-wrapper">
+                        <div class="gesture-grid">
+                            <span>👋 Hello</span><span>👍 Yes</span><span>👎 No</span>
+                            <span>🙏 Thank You</span><span>👌 Okay</span><span>➡️ Send</span>
+                            <span>🔙 Backspace</span><span>❓ Help</span><span>💬 What</span>
+                            <span>📍 Where</span><span>⏳ When</span><span>🫵 You</span>
+                            <span>🗺️ Here</span><span>🛡️ Need</span><span>✌️ Peace</span>
+                            <span>🗣️ Talk</span><span>⏰ Time</span><span>👤 Who</span>
+                            <span>💡 Why</span><span>🔢 Numbers [0-9]</span>
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </aside>
+
+        <main class="chat-workspace">
+            <header class="workspace-header">
+                <div class="node-profile">
+                    <div class="avatar-gradient">🔮</div>
+                    <div>
+                        <h3>SI-Lingual Engine Node</h3>
+                        <p class="pipeline-status">Client Node Synchronized</p>
+                    </div>
+                </div>
+                <div class="theme-control-wrapper">
+                    <button id="theme-toggle-btn" class="theme-switch-control" aria-label="Toggle Theme Layout">
+                        <span class="sun-icon">🌙</span>
+                        <span class="moon-icon">☀️</span>
+                    </button>
+                </div>
+            </header>
+
+            <div class="message-feed" id="chat-messages">
+                <div class="message system-msg">
+                    <p>Optical parsing terminal operational. Use gesture streams or typing to compose data strings.</p>
+                </div>
+            </div>
+
+            <footer class="input-action-bar">
+                <input type="text" id="text-input" placeholder="Awaiting gesture matrix data streams..." autocomplete="off">
+                <button id="send-btn">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M2,21L23,12L2,3V10L17,12L2,14V21Z"/></svg>
+                </button>
+            </footer>
+        </main>
+    </div>
+
+    <script type="module">
+        import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/+esm";
+
+        const video = document.getElementById("webcam");
+        const canvasElement = document.getElementById("output_canvas");
+        const canvasCtx = canvasElement.getContext("2d");
+        const gestureStatus = document.getElementById("gesture-detected");
+        const statusDot = document.getElementById("status-dot");
+        const loadingOverlay = document.getElementById("loading-overlay");
+        const chatMessages = document.getElementById("chat-messages");
+        const textInput = document.getElementById("text-input");
+        const sendBtn = document.getElementById("send-btn");
+
+        window.canvasCtx = canvasCtx; 
+
+        let handLandmarker = undefined;
+        let webcamRunning = false;
+        let lastVideoTime = -1;
+        let gestureCooldown = false;
+
+        const MAX_SEQUENCE_LENGTH = 126; 
+        let landmarkSequenceBuffer = [];
+
+        const backendSocket = new WebSocket("ws://localhost:8000/gesture-stream");
+        backendSocket.onopen = () => { console.log("🚀 Connected to AI Backend Server Pipeline!"); };
+        
+        backendSocket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            const predictedGesture = data.gesture;
+            if (predictedGesture && predictedGesture !== "None") {
+                gestureStatus.innerText = `AI: ${predictedGesture}`;
+                if (!gestureCooldown) {
+                    textInput.value += ` ${predictedGesture} `;
+                    gestureCooldown = true;
+                    setTimeout(() => { gestureCooldown = false; }, 1500); 
+                }
+            }
+        };
+
+        const themeToggleBtn = document.getElementById("theme-toggle-btn");
+        if (themeToggleBtn) {
+            themeToggleBtn.addEventListener("click", () => {
+                const activeTheme = document.documentElement.getAttribute("data-theme");
+                if (activeTheme === "light") {
+                    document.documentElement.removeAttribute("data-theme");
+                } else {
+                    document.documentElement.setAttribute("data-theme", "light");
+                }
+            });
+        }
+
+        async function startCameraStream() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 480, height: 360, frameRate: { ideal: 60 } } 
+                });
+                video.srcObject = stream;
+                return new Promise((resolve) => {
+                    video.addEventListener("loadeddata", () => {
+                        webcamRunning = true;
+                        canvasElement.width = video.videoWidth;
+                        canvasElement.height = video.videoHeight;
+                        requestAnimationFrame(renderLoop);
+                        resolve();
+                    });
+                });
+            } catch (err) {
+                console.error("Camera access blocked by safety layer:", err);
+                loadingOverlay.innerText = "Camera Blocked. Check your browser permissions.";
+                throw err;
+            }
+        }
+
+        async function initTrackingEngine() {
+            try {
+                const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm");
+                handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numHands: 2, 
+                    minHandDetectionConfidence: 0.5, 
+                    minHandPresenceConfidence: 0.5,   
+                    minTrackingConfidence: 0.5
+                });
+                loadingOverlay.style.display = "none";
+            } catch (err) {
+                console.error("Tracking framework engine load failure:", err);
+                loadingOverlay.innerText = "Sync failure on background tracking binaries.";
+            }
+        }
+
+        // ====================================================================
+        // ⚡ DOUBLE-BUFFERED SYNCHRONOUS RENDERING PIPELINE
+        // ====================================================================
+        function renderLoop() {
+            if (!webcamRunning) return;
+
+            // 1. Prepare and apply global mirroring transform for the camera frame draw
+            canvasCtx.save();
+            canvasCtx.translate(canvasElement.width, 0);
+            canvasCtx.scale(-1, 1);
+
+            // 2. Stream feed directly into the canvas array space
+            canvasCtx.drawImage(video, 0, 0, canvasElement.width, canvasElement.height);
+            
+            // Restore context canvas options to ensure drawing layers don't stack coordinates recursively
+            canvasCtx.restore();
+
+            // 3. Process tracking operations against the hardware stream frame
+            if (handLandmarker && video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+
+                try {
+                    const timestamp = performance.now();
+                    const results = handLandmarker.detectForVideo(video, timestamp);
+                    
+                    if (results.landmarks && results.landmarks.length > 0) {
+                        statusDot.classList.add("active");
+
+                        // Render tracking paths immediately to map directly to mirrored feed matrix
+                        results.landmarks.forEach((landmarks) => {
+                            drawGeometricSkeleton(landmarks);
+                        });
+
+                        const primaryHandFeatures = results.landmarks[0].map(pt => [
+                            parseFloat(pt.x.toFixed(4)), 
+                            parseFloat(pt.y.toFixed(4)), 
+                            parseFloat(pt.z.toFixed(4))
+                        ]);
+
+                        landmarkSequenceBuffer.push(primaryHandFeatures);
+
+                        if (landmarkSequenceBuffer.length > MAX_SEQUENCE_LENGTH) {
+                            landmarkSequenceBuffer.shift(); 
+                        }
+
+                        if (landmarkSequenceBuffer.length === MAX_SEQUENCE_LENGTH && backendSocket.readyState === WebSocket.OPEN) {
+                            backendSocket.send(JSON.stringify({
+                                sequence: landmarkSequenceBuffer 
+                            }));
+                        }
+
+                        evaluateLocalRules(results.landmarks[0]);
+                    } else {
+                        statusDot.classList.remove("active");
+                        if (landmarkSequenceBuffer.length > 0) {
+                            landmarkSequenceBuffer.shift();
+                        }
+                    }
+                } catch (error) {
+                    console.error("Inference processing error encountered:", error);
+                }
+            } else if (!handLandmarker || !statusDot.classList.contains("active")) {
+                gestureStatus.innerText = "Scanning Tracking Matrix...";
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        function drawGeometricSkeleton(rawlandmarks) {
+            if (!rawlandmarks || rawlandmarks.length === 0) return;
+
+            const isLightTheme = document.documentElement.getAttribute("data-theme") === "light";
+            let lineStyle, jointStyle, glowStyle;
+
+            if (isLightTheme) {
+                lineStyle = "#83C3FF";   
+                jointStyle = "#E25C70";  
+                glowStyle = "#FFA4A2";   
+            } else {
+                lineStyle = "rgba(255, 255, 255, 0.85)"; 
+                jointStyle = "#ff4a8d";                 
+                glowStyle = "rgba(255, 74, 141, 0.35)";  
+            }
+
+            canvasCtx.strokeStyle = lineStyle;
+            canvasCtx.lineWidth = 4;                  
+            canvasCtx.lineCap = "round";
+
+            // Map raw coordinates instantly to mirrored coordinates without computational delay
+            const instantPoints = rawlandmarks.map(rawNode => ({
+                x: (1 - rawNode.x) * canvasElement.width, 
+                y: rawNode.y * canvasElement.height
+            }));
+
+            const connections = [
+                [0,1],[1,2],[2,3],[3,4],        // Thumb
+                [0,5],[5,6],[6,7],[7,8],        // Index
+                [5,9],[9,10],[10,11],[11,12],   // Middle
+                [9,13],[13,14],[14,15],[15,16], // Ring
+                [0,17],[17,18],[18,19],[19,20], // Pinky
+                [5,9],[9,13],[13,17]            // Palm base loops
+            ];
+
+            // Render bones
+            connections.forEach(([start, end]) => {
+                if(instantPoints[start] && instantPoints[end]) {
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(instantPoints[start].x, instantPoints[start].y);
+                    canvasCtx.lineTo(instantPoints[end].x, instantPoints[end].y);
+                    canvasCtx.stroke();
+                }
+            });
+            
+            // Render node joints
+            instantPoints.forEach((node) => {
+                canvasCtx.beginPath();
+                canvasCtx.arc(node.x, node.y, 6, 0, 2 * Math.PI); 
+                canvasCtx.fillStyle = glowStyle;
+                canvasCtx.fill();
+                
+                canvasCtx.beginPath();
+                canvasCtx.arc(node.x, node.y, 3, 0, 2 * Math.PI); 
+                canvasCtx.fillStyle = jointStyle;
+                canvasCtx.fill();
+            });
+        }
+
+        function evaluateLocalRules(lm) {
+            const thumbTip = lm[4]; const indexTip = lm[8]; const middleTip = lm[12]; const ringTip = lm[16]; const pinkyTip = lm[20];
+            const indexFolded = indexTip.y > lm[6].y; const middleFolded = middleTip.y > lm[10].y; const ringFolded = ringTip.y > lm[14].y; const pinkyFolded = pinkyTip.y > lm[18].y;
+
+            if (Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y) < 0.04 && !middleFolded && !ringFolded && !pinkyFolded) {
+                routeLocalAction("Okay 👌", "Okay"); return;
+            }
+            if (!indexFolded && !middleFolded && ringFolded && pinkyFolded) {
+                routeLocalAction("Peace ✌️", "Peace"); return;
+            }
+            if (indexFolded && middleFolded && ringFolded && pinkyFolded) {
+                routeLocalAction("Backspace 🔙", "Backspace"); return;
+            }
+        }
+
+        function routeLocalAction(display, value) {
+            gestureStatus.innerText = display;
+            if (gestureCooldown) return;
+            gestureCooldown = true;
+            setTimeout(() => { gestureCooldown = false; }, 1500);
+
+            if (value === "Backspace") { textInput.value = textInput.value.slice(0, -1); }
+            else if (value === "Peace") { appendUserMessage(); }
+            else { textInput.value += ` [${value}] `; }
+        }
+
+        function appendUserMessage() {
+            const text = textInput.value.trim();
+            if (!text) return;
+            const bubble = document.createElement("div");
+            bubble.className = "message user-msg";
+            bubble.innerHTML = `<p>${text}</p>`;
+            chatMessages.appendChild(bubble);
+            textInput.value = "";
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+
+            setTimeout(() => {
+                const response = document.createElement("div");
+                response.className = "message bot-msg";
+                response.innerHTML = `<p>Data vector parameters analyzed by SI-Lingual node model framework.</p>`;
+                chatMessages.appendChild(response);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }, 800);
+        }
+
+        sendBtn.addEventListener("click", appendUserMessage);
+        textInput.addEventListener("keypress", (e) => { if (e.key === "Enter") appendUserMessage(); });
+
+        startCameraStream()
+            .then(() => initTrackingEngine())
+            .catch(err => console.error("Startup sequence failed:", err));
+    </script>
+</body>
+</html>
